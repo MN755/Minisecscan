@@ -1,1 +1,3 @@
 # Minisecscan
+
+### NOTICE: Not Finished! 
