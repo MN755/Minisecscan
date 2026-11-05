@@ -24,20 +24,27 @@ inputs:
     description: "Path to write JSON report"
     required: false
     default: "minisecscan-report.json"
+  artifact_name:
+    description: "Name of the uploaded report artifact"
+    required: false
+    default: "minisecscan-report"
 
 outputs:
   score:
     description: "Final score (0-100)"
+    value: ${{ steps.set-outputs.outputs.score }}
   grade:
     description: "Letter grade (A/B/C/D)"
+    value: ${{ steps.set-outputs.outputs.grade }}
   findings:
     description: "Total finding count"
+    value: ${{ steps.set-outputs.outputs.findings }}
 
 runs:
   using: "composite"
   steps:
     - name: Setup Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: "3.11"
 
@@ -45,29 +52,44 @@ runs:
       shell: bash
       run: |
         python -m pip install --upgrade pip
-        pip install -r $GITHUB_ACTION_PATH/requirements.txt
+        python -m pip install -r "$GITHUB_ACTION_PATH/requirements.txt"
 
     - name: Run MiniSecScan
       id: run
       shell: bash
+      env:
+        SCAN_URL: ${{ inputs.url }}
+        SCAN_FILE: ${{ inputs.file }}
+        SCAN_MIN_SCORE: ${{ inputs.min_score }}
+        SCAN_FAIL_ON: ${{ inputs.fail_on }}
+        SCAN_OUTPUT_JSON: ${{ inputs.output_json }}
       run: |
         python "$GITHUB_ACTION_PATH/run.py" \
-          --url "${{ inputs.url }}" \
-          --file "${{ inputs.file }}" \
-          --min-score "${{ inputs.min_score }}" \
-          --fail-on "${{ inputs.fail_on }}" \
-          --out "${{ inputs.output_json }}"
+          --url "$SCAN_URL" \
+          --file "$SCAN_FILE" \
+          --min-score "$SCAN_MIN_SCORE" \
+          --fail-on "$SCAN_FAIL_ON" \
+          --out "$SCAN_OUTPUT_JSON"
 
     - name: Set outputs
       id: set-outputs
+      if: ${{ always() && steps.run.outcome != 'skipped' }}
       shell: bash
+      env:
+        SCAN_OUTPUT_JSON: ${{ inputs.output_json }}
       run: |
-        echo "score=$(jq -r .score '${{ inputs.output_json }}')" >> $GITHUB_OUTPUT
-        echo "grade=$(jq -r .grade '${{ inputs.output_json }}')" >> $GITHUB_OUTPUT
-        echo "findings=$(jq -r '.findings | length' '${{ inputs.output_json }}')" >> $GITHUB_OUTPUT
+        python - <<'PY'
+        import json, os
+        with open(os.environ["SCAN_OUTPUT_JSON"]) as source:
+            report = json.load(source)
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"score={report['score']}\ngrade={report['grade']}\nfindings={len(report['findings'])}\n")
+        PY
 
     - name: Upload report artifact
-      uses: actions/upload-artifact@v4
+      if: ${{ always() && steps.run.outcome != 'skipped' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
-        name: minisecscan-report
+        name: ${{ inputs.artifact_name }}
         path: ${{ inputs.output_json }}
+        if-no-files-found: error

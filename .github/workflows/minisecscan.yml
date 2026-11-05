@@ -3,66 +3,139 @@ name: MiniSecScan
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: Optional public HTTPS website you own; empty runs scanner regression tests only
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   scan:
+    name: scan
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Example: supply a preview URL via label, env, or secret. Replace this.
-      - name: Decide target URL
-        id: target
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install scanner dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Test secure and vulnerable pages against both scanner entry points
+        run: python -m unittest discover -s tests -v
+      - name: Start controlled HTTPS target
+        id: fixture
+        shell: bash
         run: |
-          # Set your preview URL here. Could be env, PR comment trigger, etc.
-          echo "url=https://example.com" >> $GITHUB_OUTPUT
-
-      - name: MiniSecScan
+          fixture_dir="$RUNNER_TEMP/minisecscan-fixture"
+          mkdir -p "$fixture_dir"
+          python tests/fixture_server.py --directory "$fixture_dir" > "$fixture_dir/server.log" 2>&1 &
+          echo "$!" > "$fixture_dir/server.pid"
+          for attempt in {1..40}; do
+            if [ -f "$fixture_dir/fixture.json" ]; then break; fi
+            kill -0 "$(cat "$fixture_dir/server.pid")"
+            sleep 0.25
+          done
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          state = json.loads((Path(os.environ["RUNNER_TEMP"]) / "minisecscan-fixture/fixture.json").read_text())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"url={state['url']}/secure\ninsecure_url={state['url']}/insecure\nca_bundle={state['ca_bundle']}\n")
+          PY
+      - name: Exercise the composite action with unchanged security thresholds
         id: scan
         uses: ./.github/actions/minisecscan
+        env:
+          REQUESTS_CA_BUNDLE: ${{ steps.fixture.outputs.ca_bundle }}
+          NO_PROXY: 127.0.0.1,localhost
         with:
-          url: ${{ steps.target.outputs.url }}
-          # file: ./dist/index.html          # alternative if scanning a local file
+          url: ${{ steps.fixture.outputs.url }}
           min_score: 75
           fail_on: HIGH
-          output_json: minisecscan-report.json
-
-      - name: Read JSON for comment
-        id: read
+          output_json: minisecscan-fixture-report.json
+          artifact_name: minisecscan-fixture-report
+      - name: Verify composite outputs
+        env:
+          SCAN_SCORE: ${{ steps.scan.outputs.score }}
+          SCAN_GRADE: ${{ steps.scan.outputs.grade }}
+          SCAN_FINDINGS: ${{ steps.scan.outputs.findings }}
         run: |
-          echo "score=$(jq -r .score minisecscan-report.json)" >> $GITHUB_OUTPUT
-          echo "grade=$(jq -r .grade minisecscan-report.json)" >> $GITHUB_OUTPUT
-          echo "count=$(jq '.findings | length' minisecscan-report.json)" >> $GITHUB_OUTPUT
-          # Build a short markdown table of top 5 findings
-          echo 'table<<EOF' >> $GITHUB_OUTPUT
-          jq -r '
-            .findings[:5] |
-            (["Severity","Title","Remediation"] | @tsv),
-            (.[] | [ .severity, .title, .remediation ] | @tsv)
-          ' minisecscan-report.json | awk 'BEGIN{print "|Severity|Title|Remediation|\n|---|---|---|"} {gsub("\t","|"); print "|" $0 "|"}' >> $GITHUB_OUTPUT
-          echo 'EOF' >> $GITHUB_OUTPUT
-
-      - name: Comment on PR
-        uses: actions/github-script@v7
+          python - <<'PY'
+          import os
+          assert os.environ["SCAN_SCORE"] == "100"
+          assert os.environ["SCAN_GRADE"] == "A"
+          assert os.environ["SCAN_FINDINGS"] == "0"
+          PY
+      - name: Expected rejection of vulnerable fixture
+        id: rejection
+        # Only this deliberate negative control may fail; the next step must prove why.
+        continue-on-error: true
+        uses: ./.github/actions/minisecscan
+        env:
+          REQUESTS_CA_BUNDLE: ${{ steps.fixture.outputs.ca_bundle }}
+          NO_PROXY: 127.0.0.1,localhost
         with:
-          script: |
-            const body = `
-            ## 🛡️ MiniSecScan
-            **Target:** ${process.env.TARGET_URL || '${{ steps.target.outputs.url }}'}
+          url: ${{ steps.fixture.outputs.insecure_url }}
+          min_score: 75
+          fail_on: HIGH
+          output_json: minisecscan-rejection-report.json
+          artifact_name: minisecscan-rejection-report
+      - name: Require failure and preserved report from negative control
+        env:
+          REJECTION_OUTCOME: ${{ steps.rejection.outcome }}
+          REJECTION_SCORE: ${{ steps.rejection.outputs.score }}
+          REJECTION_FINDINGS: ${{ steps.rejection.outputs.findings }}
+        run: |
+          python - <<'PY'
+          import json, os
+          assert os.environ["REJECTION_OUTCOME"] == "failure"
+          assert int(os.environ["REJECTION_SCORE"]) < 75
+          assert int(os.environ["REJECTION_FINDINGS"]) > 0
+          with open("minisecscan-rejection-report.json") as source:
+              report = json.load(source)
+          assert any(f["severity"] == "HIGH" for f in report["findings"])
+          assert {"Content-Security-Policy missing", "HSTS missing"} <= {f["title"] for f in report["findings"]}
+          PY
+      - name: Stop controlled HTTPS target
+        if: ${{ always() }}
+        run: |
+          pid_file="$RUNNER_TEMP/minisecscan-fixture/server.pid"
+          if [ -f "$pid_file" ]; then kill "$(cat "$pid_file")" || true; fi
 
-            **Score:** **${{ steps.read.outputs.score }}** (**${{ steps.read.outputs.grade }}**)  
-            **Findings:** ${{ steps.read.outputs.count }}
-
-            ${'${{ steps.read.outputs.table }}'}
-
-            _Full JSON report uploaded as an artifact (minisecscan-report.json)._`;
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
-            })
+  website:
+    name: configured website scan
+    if: ${{ inputs.target_url != '' || vars.MINISECSCAN_TARGET_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate configured target
+        env:
+          TARGET_URL: ${{ inputs.target_url || vars.MINISECSCAN_TARGET_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          target = urlparse(os.environ["TARGET_URL"])
+          if target.scheme != "https" or not target.hostname or target.username or target.password:
+              raise SystemExit("Configure an HTTPS website URL without embedded credentials")
+          PY
+      - name: Scan configured website
+        uses: ./.github/actions/minisecscan
+        with:
+          url: ${{ inputs.target_url || vars.MINISECSCAN_TARGET_URL }}
+          min_score: 75
+          fail_on: HIGH
+          output_json: minisecscan-website-report.json
+          artifact_name: minisecscan-website-report
